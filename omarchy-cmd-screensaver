@@ -1,0 +1,305 @@
+#!/bin/bash
+# Check if a specific file was provided as argument
+if [[ $# -gt 0 ]]; then
+  if [[ -f "$1" ]]; then
+    SPECIFIC_FILE="$1"
+  else
+    echo "Error: File '$1' not found" >&2
+    exit 1
+  fi
+else
+  SPECIFIC_FILE=""
+fi
+
+screensaver_in_focus() {
+  hyprctl activewindow -j | jq -e '.class == "Screensaver"' >/dev/null 2>&1
+}
+exit_screensaver() {
+  hyprctl keyword cursor:invisible false
+  pkill -x tte 2>/dev/null
+  pkill -f "alacritty --class Screensaver" 2>/dev/null
+  [[ -n "$temp_file" ]] && rm -f "$temp_file"
+  exit 0
+}
+trap exit_screensaver SIGINT SIGTERM SIGHUP SIGQUIT
+hyprctl keyword cursor:invisible true
+
+# Reduce subshells: cache available effects once
+mapfile -t _effects < <(tte 2>&1 | grep -oP '{\K[^}]+' | tr ',' ' ' | tr ' ' '\n' | sed -n '/^beams$/,$p' | sort -u)
+[[ ${#_effects[@]} -eq 0 ]] && _effects=(beams)
+
+# Use globbing for file discovery
+shopt -s nullglob globstar
+
+# If specific file provided, run once; otherwise loop infinitely
+if [[ -n "$SPECIFIC_FILE" ]]; then
+  # Run once for specific file
+  temp_file=""
+  screensaver_file="$SPECIFIC_FILE"
+  # Pick a random cached effect
+  effect="${_effects[$((RANDOM % ${#_effects[@]}))]}"
+  # Compute canvas height once per loop
+  lines=$(tput lines)
+  (( lines > 2 )) || lines=3
+  canvas_h=$((lines - 2))
+  
+  # Display and run effect for specific file
+  if [[ -n "$screensaver_file" ]]; then
+    # First display the ANSI file with original colors for 2 seconds, centered
+    clear
+    # Add some vertical spacing to align with tte positioning
+    echo -e "\n"
+    # Get terminal dimensions
+    cols=$(tput cols)
+    # Center the file content (strip ANSI codes for length calculation)
+    awk -v cols="$cols" '
+    function strip_ansi(str) {
+        gsub(/\033\[[0-9;]*[mK]/, "", str)
+        gsub(/\033\[[?]?[0-9;]*[a-zA-Z]/, "", str)
+        return str
+    }
+    {
+        # Calculate padding to center the line (ignoring ANSI codes)
+        clean_line = strip_ansi($0)
+        len = length(clean_line)
+        if (len < cols) {
+            padding = int((cols - len) / 2)
+            printf "%*s%s\n", padding, "", $0
+        } else {
+            print $0
+        }
+    }' "$screensaver_file"
+    sleep 2
+    
+    # Try running tte with the original file first (might be CP437)
+    tte -i "$screensaver_file" \
+      --frame-rate 240 --canvas-width 0 --canvas-height "$canvas_h" --anchor-canvas c --anchor-text c \
+      --existing-color-handling dynamic \
+      "$effect" 2>/dev/null &
+    pid=$!
+    sleep 0.5  # Give time for tte to start or fail due to encoding error
+    if ! kill -0 "$pid" 2>/dev/null; then
+      # If failed, try converting from CP437 to UTF-8
+      temp_file=$(mktemp)
+      if ! iconv -f CP437 -t UTF-8 "$screensaver_file" -o "$temp_file" 2>/dev/null; then
+        rm -f "$temp_file"
+        temp_file=""
+        echo "Error: Could not process file '$screensaver_file'" >&2
+        exit 1
+      fi
+      # First display the converted file with original colors for 2 seconds, centered
+      clear
+      # Add some vertical spacing to align with tte positioning
+      echo -e "\n"
+      # Get terminal dimensions
+      cols=$(tput cols)
+      # Center the file content (strip ANSI codes for length calculation)
+      awk -v cols="$cols" '
+      function strip_ansi(str) {
+          gsub(/\033\[[0-9;]*[mK]/, "", str)
+          gsub(/\033\[[?]?[0-9;]*[a-zA-Z]/, "", str)
+          return str
+      }
+      {
+          # Calculate padding to center the line (ignoring ANSI codes)
+          clean_line = strip_ansi($0)
+          len = length(clean_line)
+          if (len < cols) {
+              padding = int((cols - len) / 2)
+              printf "%*s%s\n", padding, "", $0
+          } else {
+              print $0
+          }
+      }' "$temp_file"
+      sleep 2
+      
+      # Then run tte with the effect
+      tte -i "$temp_file" \
+        --frame-rate 240 --canvas-width 0 --canvas-height "$canvas_h" --anchor-canvas c --anchor-text c \
+        --existing-color-handling dynamic \
+        "$effect" 2>/dev/null &
+      pid=$!
+      sleep 0.5
+      if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$temp_file"
+        temp_file=""
+        echo "Error: Could not process converted file" >&2
+        exit 1
+      fi
+    fi
+    # Wait for tte to finish naturally or exit on input/inactive window
+    while kill -0 "$pid" 2>/dev/null; do
+      if read -n 1 -t 3 || ! screensaver_in_focus; then
+        exit_screensaver
+      fi
+    done
+    [[ -n "$temp_file" ]] && rm -f "$temp_file"
+    temp_file=""
+  else
+    echo "Error: No file specified" >&2
+    exit 1
+  fi
+  # Exit after running once for specific file
+  exit_screensaver
+else
+  # Loop infinitely for random files from screensaver directory
+  while true; do
+    temp_file=""
+    # Randomly select an .ans file from the screensaver directory via globbing
+    # Try both .ans and .txt files (CP437 and UTF-8)
+    files=("$HOME/.config/omarchy/branding/screensaver"/**/*.{ans,txt})
+    if [[ ${#files[@]} -gt 0 ]]; then
+      screensaver_file="${files[$((RANDOM % ${#files[@]}))]}"
+    else
+      screensaver_file=""
+    fi
+  # Pick a random cached effect
+  effect="${_effects[$((RANDOM % ${#_effects[@]}))]}"
+  # Compute canvas height once per loop
+  lines=$(tput lines)
+  (( lines > 2 )) || lines=3
+  canvas_h=$((lines - 2))
+  # Check if a valid file was found, otherwise use fallback
+  if [[ -n "$screensaver_file" ]]; then
+    # First display the ANSI file with original colors for 2 seconds, centered
+    clear
+    # Add some vertical spacing to align with tte positioning
+    echo -e "\n"
+    # Get terminal dimensions
+    cols=$(tput cols)
+    # Center the file content (strip ANSI codes for length calculation)
+    awk -v cols="$cols" '
+    function strip_ansi(str) {
+        gsub(/\033\[[0-9;]*[mK]/, "", str)
+        gsub(/\033\[[?]?[0-9;]*[a-zA-Z]/, "", str)
+        return str
+    }
+    {
+        # Calculate padding to center the line (ignoring ANSI codes)
+        clean_line = strip_ansi($0)
+        len = length(clean_line)
+        if (len < cols) {
+            padding = int((cols - len) / 2)
+            printf "%*s%s\n", padding, "", $0
+        } else {
+            print $0
+        }
+    }' "$screensaver_file"
+    sleep 2
+    
+    # Try running tte with the original file first (might be CP437)
+    tte -i "$screensaver_file" \
+      --frame-rate 240 --canvas-width 0 --canvas-height "$canvas_h" --anchor-canvas c --anchor-text c \
+      --existing-color-handling dynamic \
+      "$effect" 2>/dev/null &
+    pid=$!
+    sleep 0.5  # Give time for tte to start or fail due to encoding error
+    if ! kill -0 "$pid" 2>/dev/null; then
+      # If failed, try converting from CP437 to UTF-8
+      temp_file=$(mktemp)
+      if ! iconv -f CP437 -t UTF-8 "$screensaver_file" -o "$temp_file" 2>/dev/null; then
+        rm -f "$temp_file"
+        temp_file=""
+        sleep 1
+        continue  # Skip if conversion fails
+      fi
+      # First display the converted file with original colors for 2 seconds, centered
+      clear
+      # Add some vertical spacing to align with tte positioning
+      echo -e "\n\n"
+      # Get terminal dimensions
+      cols=$(tput cols)
+      # Center the file content (strip ANSI codes for length calculation)
+      awk -v cols="$cols" '
+      function strip_ansi(str) {
+          gsub(/\033\[[0-9;]*[mK]/, "", str)
+          gsub(/\033\[[?]?[0-9;]*[a-zA-Z]/, "", str)
+          return str
+      }
+      {
+          # Calculate padding to center the line (ignoring ANSI codes)
+          clean_line = strip_ansi($0)
+          len = length(clean_line)
+          if (len < cols) {
+              padding = int((cols - len) / 2)
+              printf "%*s%s\n", padding, "", $0
+          } else {
+              print $0
+          }
+      }' "$temp_file"
+      sleep 2
+      
+      # Then run tte with the effect
+      tte -i "$temp_file" \
+        --frame-rate 240 --canvas-width 0 --canvas-height "$canvas_h" --anchor-canvas c --anchor-text c \
+        "$effect" 2>/dev/null &
+      pid=$!
+      sleep 0.5
+      if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$temp_file"
+        temp_file=""
+        sleep 1
+        continue  # Skip if converted file still fails
+      fi
+    fi
+    # Wait for tte to finish naturally or exit on input/inactive window
+    while kill -0 "$pid" 2>/dev/null; do
+      if read -n 1 -t 3 || ! screensaver_in_focus; then
+        exit_screensaver
+      fi
+    done
+    [[ -n "$temp_file" ]] && rm -f "$temp_file"
+    temp_file=""
+  else
+    # Fallback to screensaver.txt if no .ans files are found
+    fallback_file="$HOME/.config/omarchy/branding/screensaver.txt"
+    if [[ -f "$fallback_file" ]]; then
+      # First display the fallback file with original colors for 2 seconds, centered
+      clear
+      # Add some vertical spacing to align with tte positioning
+      echo -e "\n\n"
+      # Get terminal dimensions
+      cols=$(tput cols)
+      # Center the file content (strip ANSI codes for length calculation)
+      awk -v cols="$cols" '
+      function strip_ansi(str) {
+          gsub(/\033\[[0-9;]*[mK]/, "", str)
+          gsub(/\033\[[?]?[0-9;]*[a-zA-Z]/, "", str)
+          return str
+      }
+      {
+          # Calculate padding to center the line (ignoring ANSI codes)
+          clean_line = strip_ansi($0)
+          len = length(clean_line)
+          if (len < cols) {
+              padding = int((cols - len) / 2)
+              printf "%*s%s\n", padding, "", $0
+          } else {
+              print $0
+          }
+      }' "$fallback_file"
+      sleep 2
+      
+      # Then run tte with the effect
+      tte -i "$fallback_file" \
+        --frame-rate 240 --canvas-width 0 --canvas-height "$canvas_h" --anchor-canvas c --anchor-text c \
+        "$effect" 2>/dev/null &
+      pid=$!
+      sleep 0.5
+      if ! kill -0 "$pid" 2>/dev/null; then
+        sleep 1
+        continue  # Skip if fallback fails (unlikely, but for consistency)
+      fi
+      while kill -0 "$pid" 2>/dev/null; do
+        if read -n 1 -t 3 || ! screensaver_in_focus; then
+          exit_screensaver
+        fi
+      done
+    else
+      # If no files are available, wait briefly before trying again
+      sleep 1
+      continue
+    fi
+  fi
+  done
+fi
